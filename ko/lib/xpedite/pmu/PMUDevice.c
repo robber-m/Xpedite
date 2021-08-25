@@ -31,6 +31,7 @@
 MODULE_AUTHOR("Manikandan Dhamodharan");
 MODULE_DESCRIPTION("Xpedite module to program PMU unit in Intel processors");
 MODULE_VERSION("2.0");
+MODULE_LICENSE("GPL");
 
 static int    majorNumber;
 static struct class*  pmuClass  = NULL;

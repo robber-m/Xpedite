@@ -40,7 +40,7 @@ class PMUCtrl(object):
       hostname = socket.gethostname()
       raise Exception('Xpedite device driver not loaded | run "xpedite pmc --enable" at '
           'host {} to enable pmc'.format(hostname))
-    self.device = open(XPEDITE_DEVICE, 'w')
+    self.device = open(XPEDITE_DEVICE, 'wb')
     return self
 
   def __exit__(self, *args):

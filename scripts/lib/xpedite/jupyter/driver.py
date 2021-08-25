@@ -210,7 +210,7 @@ def launchJupyter(homeDir):
   jupyterEnv['PATH'] = pyPath
   jupyterEnv['HOME'] = tempfile.mkdtemp(prefix=SHELL_PREFIX, dir='/tmp')
   jupyterBinary = binPath('jupyter')
-  os.execle(jupyterBinary, 'Xpedite', 'notebook', '--no-browser', '--notebook-dir='+homeDir, jupyterEnv)
+  os.execle(jupyterBinary, 'Xpedite', 'notebook', '--allow-root', '--no-browser', '--notebook-dir='+homeDir, jupyterEnv)
 
 def validatePath(homeDir, reportName):
   """Validates the path to store xpedite notebook and data files"""
