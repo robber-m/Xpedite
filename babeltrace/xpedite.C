@@ -63,11 +63,6 @@ struct xpedite_iter {
  */
 void create_event_class(bt_stream_class *stream_class, ProbeInfo *probe)
 {
-     #if 0
-    /* Borrow trace class from stream class */
-    bt_trace_class *trace_class =
-        bt_stream_class_borrow_trace_class(stream_class);
-    #endif
 
     /* Create a default event class */
     bt_event_class *event_class = bt_event_class_create_with_id(stream_class, (uint64_t)probe->recorder_return_site);
@@ -75,39 +70,14 @@ void create_event_class(bt_stream_class *stream_class, ProbeInfo *probe)
     /* Name the event class */
     bt_event_class_set_name(event_class, probe->name.c_str());
 
-    #if 0
-    /*
-     * Create an empty structure field class to be used as the
-     * event class's payload field class.
-     */
-    bt_field_class *payload_field_class =
-        bt_field_class_structure_create(trace_class);
- 
-    /*
-     * Create a string field class to be used as the payload field
-     * class's `msg` member.
-     */
-    bt_field_class *msg_field_class =
-        bt_field_class_string_create(trace_class);
- 
-    /*
-     * Append the string field class to the structure field class as the
-     * `msg` member.
-     */
-    bt_field_class_structure_append_member(payload_field_class, "msg",
-        msg_field_class);
- 
-    /* Set the event class's payload field class */
-    bt_event_class_set_payload_field_class(event_class, payload_field_class);
- 
-    /* Put the references we don't need anymore */
-    bt_field_class_put_ref(payload_field_class);
-    bt_field_class_put_ref(msg_field_class);
-    #endif
     bt_value *attributes = bt_event_class_borrow_user_attributes(event_class);
-    bt_value_map_insert_string_entry(attributes, "function", probe->function.c_str());
-    bt_value_map_insert_string_entry(attributes, "file", probe->file.c_str());
-    bt_value_map_insert_unsigned_integer_entry(attributes, "line", probe->line);
+    {
+         bt_value_map_insert_string_entry(attributes, "bin", "xpedite-application");
+         bt_value_map_insert_string_entry(attributes, "func", probe->function.c_str());
+         std::ostringstream src_string;
+         src_string << probe->file << ":" << probe->line;
+         bt_value_map_insert_string_entry(attributes, "src", src_string.str().c_str());
+    }
 
     bt_event_class_put_ref(event_class);
 }
@@ -144,8 +114,6 @@ void create_metadata_and_stream(bt_self_component *self_component,
     bt_stream_class_set_assigns_automatic_event_class_id(stream_class, BT_FALSE);
     bt_stream_class_set_supports_packets(stream_class, BT_TRUE, BT_TRUE, BT_FALSE);
 
-    /* Create a default trace from (instance of `trace_class`) */
-    bt_trace *trace = bt_trace_create(trace_class);
     // TODO: populate trace details from xpedite-appinfo or python
 
     {
@@ -162,10 +130,45 @@ void create_metadata_and_stream(bt_self_component *self_component,
          bt_field_class_put_ref(packet_context_field_class);
     }
 
+    #ifdef POPULATE_DEBUG_INFO
+    // declare common fields across all stream events
+    {
+         // TODO: only populate these details if debug info is enabled
+         bt_field_class *event_common_context_field_class =
+              bt_field_class_structure_create(trace_class);
+
+         bt_field_class *debug_info_field_class = bt_field_class_structure_create(trace_class);
+         {
+              // TODO: pull binary, port, and pid from the appinfo file
+              bt_field_class *bin_field_class = bt_field_class_string_create(trace_class);
+              bt_field_class_structure_append_member(debug_info_field_class, "bin", bin_field_class);
+              bt_field_class_put_ref(bin_field_class);
+
+              bt_field_class *func_field_class = bt_field_class_string_create(trace_class);
+              bt_field_class_structure_append_member(debug_info_field_class, "func", func_field_class);
+              bt_field_class_put_ref(func_field_class);
+
+              bt_field_class *src_field_class = bt_field_class_string_create(trace_class);
+              bt_field_class_structure_append_member(debug_info_field_class, "src", src_field_class);
+              bt_field_class_put_ref(src_field_class);
+         }
+         bt_field_class_structure_append_member(event_common_context_field_class, "debug_info", debug_info_field_class);
+         bt_field_class_put_ref(debug_info_field_class);
+
+         bt_stream_class_set_event_common_context_field_class(stream_class, event_common_context_field_class);
+
+         /* Put the references we don't need anymore */
+         bt_field_class_put_ref(event_common_context_field_class);
+    }
+    #endif
+
     // automatically define event classes for all probes present in xpedite-appinfo.txt
     for (std::pair<const void *, ProbeInfo> element : xpedite_in->loader->returnSiteMap()) {
          create_event_class(stream_class, &element.second); // TODO: hold onto the event class to destroy it?
     }
+
+    /* Create a default trace from (instance of `trace_class`) */
+    bt_trace *trace = bt_trace_create(trace_class);
 
     /*
      * Create the source component's stream (instance of `stream_class`
@@ -352,7 +355,22 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
                         uint64_t event_class_id = (uint64_t)sample.returnSite();
                         const struct bt_event_class *event_class = bt_stream_class_borrow_event_class_by_id_const(bt_stream_borrow_class(xpedite_in->stream), event_class_id);
 
-                        messages[(*count)++] = bt_message_event_create_with_packet_and_default_clock_snapshot(self_message_iterator, event_class, iter->packet, sample_timestamp); // TODO: clock stuff
+                        bt_message *message = bt_message_event_create_with_packet_and_default_clock_snapshot(self_message_iterator, event_class, iter->packet, sample_timestamp); // TODO: clock stuff
+                        #ifdef POPULATE_DEBUG_INFO
+                        {
+                             // set debug info associated with this event
+                             const bt_value *attributes = bt_event_class_borrow_user_attributes_const(event_class);
+                             bt_field *common_context = bt_event_borrow_common_context_field(bt_message_event_borrow_event(message));
+                             bt_field *debug_info = bt_field_structure_borrow_member_field_by_name(common_context, "debug_info");
+                             bt_field_string_set_value(bt_field_structure_borrow_member_field_by_name(debug_info, "bin"),
+                                                       bt_value_string_get(bt_value_map_borrow_entry_value_const(attributes, "bin")));
+                             bt_field_string_set_value(bt_field_structure_borrow_member_field_by_name(debug_info, "func"),
+                                                       bt_value_string_get(bt_value_map_borrow_entry_value_const(attributes, "func")));
+                             bt_field_string_set_value(bt_field_structure_borrow_member_field_by_name(debug_info, "src"),
+                                                       bt_value_string_get(bt_value_map_borrow_entry_value_const(attributes, "src")));
+                        }
+                        #endif
+                        messages[(*count)++] = message;
                         iter->samples++; // advance the samples iterator
                    }
               } break;
