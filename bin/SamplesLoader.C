@@ -19,14 +19,14 @@
 #include <ios>
 
 int main(int argc_, char** argv_) {
-  if(argc_ <2) {
-    std::cerr << "[usage]: " << argv_[0] << " <samples-file>" << std::endl;
+  if(argc_ <3) {
+    std::cerr << "[usage]: " << argv_[0] << " <samples-file> <appinfo-file>" << std::endl;
     exit(1); 
   }
 
   using namespace xpedite::probes;
   using namespace xpedite::framework;
-  SamplesLoader loader {argv_[1]};
+  SamplesLoader loader {argv_[1], argv_[2]};
   auto pmcCount = loader.pmcCount();
   std::cout << "Tsc,ReturnSite,Data";
   for(unsigned i=0; i<pmcCount; ++i) {
@@ -35,7 +35,7 @@ int main(int argc_, char** argv_) {
   std::cout << std::endl;
 
   for(auto& sample : loader) {
-    std::cout << std::hex << sample.tsc() << std::dec << "," << sample.returnSite();
+    std::cout << std::hex << sample.tsc() << std::dec << "," << loader.returnSiteMap().at(sample.returnSite()).toString();
     if (sample.hasData()) {
       std::cout << std::hex << "," << std::get<1>(sample.data()) << std::setw(16) << std::setfill('0') 
         << std::right << std::get<0>(sample.data()) << std::dec;

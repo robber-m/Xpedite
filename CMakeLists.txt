@@ -50,6 +50,17 @@ add_executable(xpediteSamplesLoader ${bin_files})
 target_link_libraries(xpediteSamplesLoader xpedite)
 install(TARGETS xpediteSamplesLoader DESTINATION "bin" COMPONENT binaries)
 
+
+file(GLOB_RECURSE bt_lib_headers babeltrace/*.H)
+file(GLOB_RECURSE bt_lib_source babeltrace/*.C)
+set(bt_lib_files ${bt_lib_headers} ${bt_lib_source})
+add_library(bt_xpedite SHARED ${bt_lib_files})
+set_property(TARGET bt_xpedite PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(bt_xpedite PRIVATE /home/mcshane/source/usr/share/include)
+target_link_libraries(bt_xpedite xpedite pthread rt dl)
+target_compile_definitions(bt_xpedite PRIVATE XPEDITE_PIE=1)
+install(TARGETS bt_xpedite DESTINATION "lib" COMPONENT libraries)
+
 add_library(xpedite-pic SHARED ${lib_files})
 set_property(TARGET xpedite-pic PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(xpedite-pic pthread rt dl)
@@ -57,6 +68,8 @@ target_compile_definitions(xpedite-pic PRIVATE XPEDITE_PIE=1)
 install(TARGETS xpedite-pic DESTINATION "lib" COMPONENT libraries)
 
 ######################### Python bindings #############################
+
+list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/install/runtime/lib/python3.7/site-packages/pybind11/share/cmake/pybind11")
 
 find_package(pybind11 REQUIRED)
 pybind11_add_module(xpediteBindings lib/xpedite/pybind/Bindings.cpp)

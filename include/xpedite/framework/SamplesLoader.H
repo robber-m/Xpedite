@@ -20,18 +20,41 @@
 #include <algorithm>
 #include <stdexcept>
 #include <sstream>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <regex>
+#include <fstream>
 
 namespace xpedite { namespace framework {
+
+  struct ProbeInfo
+  {
+       public:
+
+       uint32_t id;
+       const void *recorder_return_site;
+       std::string name;
+       std::string file;
+       uint32_t line;
+       std::string function;
+
+       std::string toString() const {
+         std::ostringstream os;
+         os << "Probe [" << name << " " <<  std::hex << recorder_return_site << "]"
+         << " " << file << ":" << std::dec << line << ":" << function << "()";
+         return os.str();
+       };
+  };
 
   class SamplesLoader
   {
     int _fd;
     const FileHeader* _fileHeader;
+    std::unordered_map<const void *, ProbeInfo> _returnSiteMap;
     CallSiteMap _callSiteMap;
     const SegmentHeader* _segmentHeader;
     unsigned _size;
@@ -98,8 +121,44 @@ namespace xpedite { namespace framework {
     };
 
     explicit SamplesLoader(const char* path_)
-      : _fd {}, _fileHeader {}, _callSiteMap {}, _segmentHeader {}, _size {} {
+      : _fd {}, _fileHeader {}, _returnSiteMap {}, _callSiteMap {}, _segmentHeader {}, _size {} {
       load(path_);
+    }
+
+    explicit SamplesLoader(const char* path_, const char* appinfo_path_)
+      : _fd {}, _fileHeader {}, _returnSiteMap {}, _callSiteMap {}, _segmentHeader {}, _size {} {
+      load(path_);
+      std::ifstream appinfo;
+      appinfo.open(appinfo_path_);
+      if (!appinfo.is_open()) {
+           throw std::runtime_error{ errorMsg("failed to open appinfo file") };
+      }
+      std::string appinfo_line;
+      std::string id_prefix = "Id=";
+      while (std::getline(appinfo, appinfo_line) ) {
+         // Extraction of several sub-matches
+         const std::regex probe_info_regex("Id=([0-9]+) \\| Probe=([^|]+)\\| CallSite=([^|]+)\\| RecorderReturnSite=([^ ]+) \\| Status=[^|]+\\| Name=([^|]+) \\| File=([^|]+) \\| Line=([0-9]+) \\| Function=([^|]+) .*");
+         std::smatch probe_info_match;
+         if (std::regex_match(appinfo_line, probe_info_match, probe_info_regex)) {
+
+              uint32_t id = stoul(probe_info_match[1].str(), nullptr, 10);
+              const void *recorder_return_site = (const void*)stoull(probe_info_match[4].str(), nullptr, 0);
+              std::string name = (probe_info_match[5].str());
+              std::string file = (probe_info_match[6].str());
+              uint32_t line = stoul(probe_info_match[7].str(), nullptr, 0);
+              std::string function = (probe_info_match[8].str());
+
+              ProbeInfo probe_info {
+                   id,
+                   recorder_return_site,
+                   name,
+                   file,
+                   line,
+                   function
+              };
+              _returnSiteMap.emplace(recorder_return_site, probe_info);
+         }
+      }
     }
 
     ~SamplesLoader() {
@@ -155,6 +214,7 @@ namespace xpedite { namespace framework {
 
     uint32_t pmcCount()             const noexcept { return _fileHeader->pmcCount(); }
     const CallSiteMap callSiteMap() const noexcept { return _callSiteMap;            }
+    const std::unordered_map<const void *, ProbeInfo> returnSiteMap() const noexcept { return _returnSiteMap; }
 
     Iterator begin() const { return Iterator {_segmentHeader, samplesEnd()}; }
     Iterator end() const   { return Iterator {samplesEnd(), samplesEnd()};   }
