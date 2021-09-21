@@ -39,6 +39,7 @@ std::chrono::nanoseconds _clock_ticks_to_nanoseconds(ClockTicks first_sample_tsc
 
 /* Source component's private data */
 struct xpedite_in {
+    int32_t tid; // thread ID for the stream
     /* Stream (owned by this) */
     bt_stream *stream;
     SamplesLoader *loader;
@@ -51,6 +52,8 @@ typedef enum IterState {
 
 struct xpedite_iter {
      IterState_t state;
+     bt_packet *packet;
+     uint64_t packet_roll_timestamp;
      SamplesLoader::Iterator samples;
      ClockTicks first_sample_tsc;
 };
@@ -101,6 +104,10 @@ void create_event_class(bt_stream_class *stream_class, ProbeInfo *probe)
     bt_field_class_put_ref(payload_field_class);
     bt_field_class_put_ref(msg_field_class);
     #endif
+    bt_value *attributes = bt_event_class_borrow_user_attributes(event_class);
+    bt_value_map_insert_string_entry(attributes, "function", probe->function.c_str());
+    bt_value_map_insert_string_entry(attributes, "file", probe->file.c_str());
+    bt_value_map_insert_unsigned_integer_entry(attributes, "line", probe->line);
 
     bt_event_class_put_ref(event_class);
 }
@@ -135,16 +142,30 @@ void create_metadata_and_stream(bt_self_component *self_component,
      */
     bt_stream_class_set_default_clock_class(stream_class, clock_class);
     bt_stream_class_set_assigns_automatic_event_class_id(stream_class, BT_FALSE);
+    bt_stream_class_set_supports_packets(stream_class, BT_TRUE, BT_TRUE, BT_FALSE);
 
+    /* Create a default trace from (instance of `trace_class`) */
+    bt_trace *trace = bt_trace_create(trace_class);
+    // TODO: populate trace details from xpedite-appinfo or python
+
+    {
+         // define packet context structure
+         bt_field_class *packet_context_field_class =
+              bt_field_class_structure_create(trace_class);
+
+         bt_field_class *thread_id_field_class = bt_field_class_integer_signed_create(trace_class);
+         bt_field_class_structure_append_member(packet_context_field_class, "tid", thread_id_field_class);
+         bt_stream_class_set_packet_context_field_class(stream_class, packet_context_field_class);
+
+         /* Put the references we don't need anymore */
+         bt_field_class_put_ref(thread_id_field_class);
+         bt_field_class_put_ref(packet_context_field_class);
+    }
 
     // automatically define event classes for all probes present in xpedite-appinfo.txt
     for (std::pair<const void *, ProbeInfo> element : xpedite_in->loader->returnSiteMap()) {
          create_event_class(stream_class, &element.second); // TODO: hold onto the event class to destroy it?
     }
-
-    /* Create a default trace from (instance of `trace_class`) */
-    bt_trace *trace = bt_trace_create(trace_class);
-    // TODO: populate trace details from xpedite-appinfo or python
 
     /*
      * Create the source component's stream (instance of `stream_class`
@@ -170,9 +191,11 @@ bt_component_class_initialize_method_status xpedite_in_initialize(
         const bt_value *params, void *initialize_method_data)
 {
     /* Allocate a private data structure */
-    struct xpedite_in *xpedite_in = (struct xpedite_in*)malloc(sizeof(*xpedite_in));
+    struct xpedite_in *xpedite_in = (struct xpedite_in*)calloc(1, sizeof(*xpedite_in));
+    xpedite_in->tid = -1; // initialize to -1
 
-    xpedite_in->loader = new SamplesLoader(bt_value_string_get(bt_value_map_borrow_entry_value_const(params, "path")), bt_value_string_get(bt_value_map_borrow_entry_value_const(params, "appinfo")));
+    const char *samples_file_path = bt_value_string_get(bt_value_map_borrow_entry_value_const(params, "path"));
+    xpedite_in->loader = new SamplesLoader(samples_file_path, bt_value_string_get(bt_value_map_borrow_entry_value_const(params, "appinfo")));
 
     /* Upcast `self_component_source` to the `bt_self_component` type */
     bt_self_component *self_component =
@@ -180,6 +203,16 @@ bt_component_class_initialize_method_status xpedite_in_initialize(
 
     /* Create the source component's metadata and stream objects */
     create_metadata_and_stream(self_component, xpedite_in);
+    const std::regex samples_file_path_regex(".*/xpedite-(.*)-([0-9]+)-([0-9]+)-[^-]+.data");
+    std::cout<< "trying to match regex for: "<< samples_file_path << std::endl;;
+    std::cmatch samples_file_info_match;
+    if (std::regex_match(samples_file_path, samples_file_info_match, samples_file_path_regex)) {
+         std::cout<< "matched the regex!\n";
+         // TODO: validate that the executable name matches the appinfo
+         uint64_t trace_id = stoull(samples_file_info_match[2].str()); // TODO: use
+         int32_t thread_id = stol(samples_file_info_match[3].str(), nullptr, 10);
+         xpedite_in->tid = thread_id;
+    }
 
     /* Set the component's user data to our private data structure */
     bt_self_component_set_data(self_component, xpedite_in);
@@ -208,12 +241,6 @@ void xpedite_in_finalize(bt_self_component_source *self_component_source)
         bt_self_component_source_as_self_component(self_component_source));
 
     delete xpedite_in->loader;
-    #if 0
-    /* Put all references */
-    for ( int i = 0; i < PROBE_TYPE_COUNT; i++ ) {
-         bt_event_class_put_ref(xpedite_in->event_class[i]);
-    }
-    #endif
     bt_stream_put_ref(xpedite_in->stream);
 
     /* Free the allocated structure */
@@ -290,28 +317,46 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               /* Message iterator is ended: return the corresponding status */
               /* Create a stream end message */
               if ( iter->state != ITER_STATE_BEGIN_STREAM ) {
-                   messages[(*count)++] = bt_message_stream_end_create(self_message_iterator, xpedite_in->stream);
+                   if ( iter->packet ) {
+                        // TODO: create packet end message and clear the packet pointer
+                        messages[(*count)++] = bt_message_packet_end_create(self_message_iterator, iter->packet);
+                        BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
+                   } else {
+                        messages[(*count)++] = bt_message_stream_end_create(self_message_iterator, xpedite_in->stream);
+                        return BT_MESSAGE_ITERATOR_CLASS_NEXT_METHOD_STATUS_END;
+                   }
               }
-              return BT_MESSAGE_ITERATOR_CLASS_NEXT_METHOD_STATUS_END;
-         }
-         auto &sample = *(iter->samples);
-         uint64_t event_class_id = (uint64_t)sample.returnSite();
-         const struct bt_event_class *event_class = bt_stream_class_borrow_event_class_by_id_const(bt_stream_borrow_class(xpedite_in->stream), event_class_id);
+         } else {
+              auto &sample = *(iter->samples);
+              switch( iter->state ) {
+              case ITER_STATE_BEGIN_STREAM: {
+                 messages[(*count)++] = bt_message_stream_beginning_create(self_message_iterator, xpedite_in->stream);
+                 //std::cout<< "beginning stream 0x" << std::hex << (uintptr_t)messages[*count - 1] << std::endl;
+                 iter->first_sample_tsc = ClockTicks(sample.tsc());
+                 iter->state = ITER_STATE_APPEND_SAMPLES;
+                      // TODO: set the default clock's offset in seconds/figure out how to use the babeltrace clocks
+              } break;
+              case ITER_STATE_APPEND_SAMPLES: {
+                   // create an event
+                   uint64_t sample_timestamp = _clock_ticks_to_nanoseconds(iter->first_sample_tsc, ClockTicks(sample.tsc())).count();
+                   if ( !iter->packet ) {
+                      iter->packet = bt_packet_create(xpedite_in->stream);
+                      bt_field *context = bt_packet_borrow_context_field(iter->packet);
+                      bt_field_integer_signed_set_value(bt_field_structure_borrow_member_field_by_name(context, "tid"), xpedite_in->tid);
+                      iter->packet_roll_timestamp = sample_timestamp + 1000000000ULL; // roll packets over every second
+                      messages[(*count)++] = bt_message_packet_beginning_create_with_default_clock_snapshot(self_message_iterator, iter->packet, sample_timestamp);
+                   } else if ( sample_timestamp > iter->packet_roll_timestamp ) {
+                        messages[(*count)++] = bt_message_packet_end_create(self_message_iterator, iter->packet);
+                        BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
+                   } else {
+                        uint64_t event_class_id = (uint64_t)sample.returnSite();
+                        const struct bt_event_class *event_class = bt_stream_class_borrow_event_class_by_id_const(bt_stream_borrow_class(xpedite_in->stream), event_class_id);
 
-         switch( iter->state ) {
-         case ITER_STATE_BEGIN_STREAM: {
-            messages[(*count)++] = bt_message_stream_beginning_create(self_message_iterator, xpedite_in->stream);
-            //std::cout<< "beginning stream 0x" << std::hex << (uintptr_t)messages[*count - 1] << std::endl;
-              iter->first_sample_tsc = ClockTicks((*iter->samples).tsc());
-              iter->state = ITER_STATE_APPEND_SAMPLES;
-              // TODO: set the default clock's offset in seconds/figure out how to use the babeltrace clocks
-         } break;
-         case ITER_STATE_APPEND_SAMPLES: {
-              // create an event
-              messages[(*count)++] = bt_message_event_create_with_default_clock_snapshot(self_message_iterator, event_class, xpedite_in->stream, _clock_ticks_to_nanoseconds(iter->first_sample_tsc, ClockTicks(sample.tsc())).count()); // TODO: clock stuff
-
-              iter->samples++; // advance the samples iterator
-         } break;
+                        messages[(*count)++] = bt_message_event_create_with_packet_and_default_clock_snapshot(self_message_iterator, event_class, iter->packet, sample_timestamp); // TODO: clock stuff
+                        iter->samples++; // advance the samples iterator
+                   }
+              } break;
+              }
          }
     }
 
