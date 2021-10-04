@@ -1,15 +1,19 @@
 ////////////////////////////////////////////////////////////////////////////////////
 //
-// SamplesLoader loads probe sample data from binary files
+// Babeltrace Xpedite Plugin 
 //
 // Xpedite probes store timing and performance counter data using variable 
 // length POD objects. A collection of sample objects is grouped and written
 // as a batch. 
+// 
+// source.xpedite.input - loads probe sample data from binary files
 //
-// The loader iterates through the POD collection,  to extract 
-// records in string format for consumption by the profiler
+//   Iterate through the POD collection, to extract records into the Babeltrace
+//   framework for display, manipulation, filtering, or conversion to alternative
+//   trace formats (e.g. CTF) for use with open source profile-data analysis
+//   environments (e.g. Trace-Compass).
 //
-// Author: Manikandan Dhamodharan, Morgan Stanley
+// Author: Robert McShane, Redline Trading Solutions, Inc.
 //
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -18,15 +22,9 @@
 #include <iomanip>
 #include <ios>
 #include <chrono>
+#include "user_data_decoder.H"
 using namespace xpedite::probes;
 using namespace xpedite::framework;
-
-std::chrono::nanoseconds first_sample_ns(1630501200000000000LL);
-using ClockTicks = std::chrono::duration<double, std::ratio<1, 2494429297LL>>;
-
-std::chrono::nanoseconds _clock_ticks_to_nanoseconds(ClockTicks first_sample_tsc, ClockTicks tsc) {
-     return first_sample_ns + std::chrono::duration_cast<std::chrono::nanoseconds>(tsc-first_sample_tsc);
-}
 
 
 #include <assert.h>
@@ -50,13 +48,27 @@ typedef enum IterState {
      ITER_STATE_APPEND_SAMPLES,
 } IterState_t;
 
+using ClockTicks = std::chrono::duration<double, std::ratio<1, 2494429297LL>>;
+
 struct xpedite_iter {
      IterState_t state;
      bt_packet *packet;
      uint64_t packet_roll_timestamp;
      SamplesLoader::Iterator samples;
-     ClockTicks first_sample_tsc;
+     struct {
+          // holds both the tsc and posix nanosecond representation of the timestamp for TSC to posix conversions
+          ClockTicks tsc;
+          std::chrono::nanoseconds ns;
+     } reference_sample;
 };
+
+std::chrono::nanoseconds _clock_ticks_to_nanoseconds(struct xpedite_iter *iter, ClockTicks tsc) {
+     return iter->reference_sample.ns + std::chrono::duration_cast<std::chrono::nanoseconds>(tsc-iter->reference_sample.tsc);
+}
+
+
+// TODO: move to a plugin system where users can provide their own probe-data decoders
+#define POPULATE_PRODUCT_PROBE_SPECIFIC_FIELDS
 
 /*
  * Creates an event class within `stream_class` for the provided `probe`.
@@ -69,6 +81,41 @@ void create_event_class(bt_stream_class *stream_class, ProbeInfo *probe)
 
     /* Name the event class */
     bt_event_class_set_name(event_class, probe->name.c_str());
+
+
+    #ifdef POPULATE_PRODUCT_PROBE_SPECIFIC_FIELDS
+    // declare specific fields for this event class
+    {
+         // TODO: move this decoder to a plugin-like system which defines the
+         // field class for this event type and a decoder function to decode fields into the context
+         if ( !strcmp( bt_event_class_get_name(event_class), "ProcessPayloadStart" ) ) {
+              bt_trace_class *trace_class = bt_stream_class_borrow_trace_class(stream_class);
+              bt_field_class *event_specific_context_field_class = bt_field_class_structure_create(trace_class);
+
+
+              bt_field_class *packet_receive_time = bt_field_class_integer_signed_create(trace_class);
+              bt_field_class_structure_append_member(event_specific_context_field_class, "packetReceiveTime", packet_receive_time);
+
+              bt_field_class *feed = bt_field_class_integer_signed_create(trace_class);
+              bt_field_class_structure_append_member(event_specific_context_field_class, "feed", feed);
+
+              bt_field_class *line = bt_field_class_integer_signed_create(trace_class);
+              bt_field_class_structure_append_member(event_specific_context_field_class, "line", line);
+
+              bt_field_class *sequence_number = bt_field_class_integer_signed_create(trace_class);
+              bt_field_class_structure_append_member(event_specific_context_field_class, "sequenceNumber", sequence_number);
+
+              bt_event_class_set_specific_context_field_class(event_class, event_specific_context_field_class);
+
+
+              bt_field_class_put_ref(packet_receive_time);
+              bt_field_class_put_ref(feed);
+              bt_field_class_put_ref(line);
+              bt_field_class_put_ref(sequence_number);
+              bt_field_class_put_ref(event_specific_context_field_class);
+         }
+    }
+    #endif
 
     bt_value *attributes = bt_event_class_borrow_user_attributes(event_class);
     {
@@ -112,7 +159,7 @@ void create_metadata_and_stream(bt_self_component *self_component,
      */
     bt_stream_class_set_default_clock_class(stream_class, clock_class);
     bt_stream_class_set_assigns_automatic_event_class_id(stream_class, BT_FALSE);
-    bt_stream_class_set_supports_packets(stream_class, BT_TRUE, BT_TRUE, BT_FALSE);
+    bt_stream_class_set_supports_packets(stream_class, BT_TRUE, BT_TRUE, BT_TRUE);
 
     // TODO: populate trace details from xpedite-appinfo or python
 
@@ -322,7 +369,7 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               if ( iter->state != ITER_STATE_BEGIN_STREAM ) {
                    if ( iter->packet ) {
                         // TODO: create packet end message and clear the packet pointer
-                        messages[(*count)++] = bt_message_packet_end_create(self_message_iterator, iter->packet);
+                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_timestamp);
                         BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
                    } else {
                         messages[(*count)++] = bt_message_stream_end_create(self_message_iterator, xpedite_in->stream);
@@ -334,14 +381,15 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               switch( iter->state ) {
               case ITER_STATE_BEGIN_STREAM: {
                  messages[(*count)++] = bt_message_stream_beginning_create(self_message_iterator, xpedite_in->stream);
+                 iter->reference_sample.tsc = ClockTicks(sample.tsc());
+                 iter->reference_sample.ns = std::chrono::nanoseconds(1632755093515051228-100);// TODO: make this dynamic based on the parsed data and try to figure out how the clock stuff really works
                  //std::cout<< "beginning stream 0x" << std::hex << (uintptr_t)messages[*count - 1] << std::endl;
-                 iter->first_sample_tsc = ClockTicks(sample.tsc());
                  iter->state = ITER_STATE_APPEND_SAMPLES;
                       // TODO: set the default clock's offset in seconds/figure out how to use the babeltrace clocks
               } break;
               case ITER_STATE_APPEND_SAMPLES: {
                    // create an event
-                   uint64_t sample_timestamp = _clock_ticks_to_nanoseconds(iter->first_sample_tsc, ClockTicks(sample.tsc())).count();
+                   uint64_t sample_timestamp = _clock_ticks_to_nanoseconds(iter, ClockTicks(sample.tsc())).count();
                    if ( !iter->packet ) {
                       iter->packet = bt_packet_create(xpedite_in->stream);
                       bt_field *context = bt_packet_borrow_context_field(iter->packet);
@@ -349,7 +397,7 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
                       iter->packet_roll_timestamp = sample_timestamp + 1000000000ULL; // roll packets over every second
                       messages[(*count)++] = bt_message_packet_beginning_create_with_default_clock_snapshot(self_message_iterator, iter->packet, sample_timestamp);
                    } else if ( sample_timestamp > iter->packet_roll_timestamp ) {
-                        messages[(*count)++] = bt_message_packet_end_create(self_message_iterator, iter->packet);
+                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_timestamp);
                         BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
                    } else {
                         uint64_t event_class_id = (uint64_t)sample.returnSite();
@@ -368,6 +416,28 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
                                                        bt_value_string_get(bt_value_map_borrow_entry_value_const(attributes, "func")));
                              bt_field_string_set_value(bt_field_structure_borrow_member_field_by_name(debug_info, "src"),
                                                        bt_value_string_get(bt_value_map_borrow_entry_value_const(attributes, "src")));
+                        }
+                        #endif
+
+                        #ifdef POPULATE_PRODUCT_PROBE_SPECIFIC_FIELDS
+                        // TODO: move this to a babeltrace filter plugin which is product-specific and knows how to decode probe user data
+                        if ( sample.hasData() && !strcmp( bt_event_class_get_name(event_class), "ProcessPayloadStart" ) ) {
+                             auto sample_data = sample.data();
+                             __uint128_t metadata = std::get<0>(sample_data);
+                             PacketFingerprint_t *packet_fingerprint = (PacketFingerprint_t*)&metadata;
+                             uint64_t packet_receive_timestamp = std::get<1>(sample_data);
+                             // set user-provided metadata associated with this event
+                             bt_field *event_context = bt_event_borrow_specific_context_field(bt_message_event_borrow_event(message));
+                             bt_field_integer_unsigned_set_value(bt_field_structure_borrow_member_field_by_name(event_context, "packetReceiveTime"), packet_receive_timestamp);
+
+
+                             // TODO: set mapped labels for feed ids to map to their corresponding InRush name during initialization
+                             bt_field_integer_unsigned_set_value(bt_field_structure_borrow_member_field_by_name(event_context, "feed"),
+                                                       packet_fingerprint->feed);
+                             bt_field_integer_unsigned_set_value(bt_field_structure_borrow_member_field_by_name(event_context, "line"),
+                                                       packet_fingerprint->line);
+                             bt_field_integer_unsigned_set_value(bt_field_structure_borrow_member_field_by_name(event_context, "sequenceNumber"),
+                                                       packet_fingerprint->sequence_number);
                         }
                         #endif
                         messages[(*count)++] = message;
