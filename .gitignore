@@ -4,6 +4,8 @@
 .cache
 /build
 /install
+CMakeFiles
+install
 scripts/lib/dist
 scripts/lib/build
 scripts/lib/xpedite.egg-info

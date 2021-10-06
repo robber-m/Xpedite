@@ -112,7 +112,8 @@ namespace xpedite { namespace framework {
         return false;
       }
 
-      persistHeader(_fd);
+      _tscHz = util::estimateTscHz();
+      persistHeader(_fd, _tscHz);
       uint64_t rindex, windex;
       std::tie(rindex, windex) = _bufferPool.attachReader();
       XpediteLogInfo << "xpedite - attached reader to thread - " << tid() << " | buffer index state - [readIndex - "
@@ -172,6 +173,7 @@ namespace xpedite { namespace framework {
     pid_t tid()               const noexcept { return _tid;            }
     uint64_t lastSampledTsc() const noexcept { return _lastSampledTsc; }
     int fd()                  const noexcept { return _fd;             }
+    uint64_t tscHz()          const noexcept { return _tscHz;          }
 
     void setLastSampledTsc(uint64_t lastSampledTsc_) noexcept {
       _lastSampledTsc = lastSampledTsc_;
@@ -230,6 +232,7 @@ namespace xpedite { namespace framework {
 
     BufferPool _bufferPool;
     SamplesBuffer* _next;
+    uint64_t _tscHz;
     int _fd;
     const pid_t _tid;
     const uint64_t _tlsAddr;

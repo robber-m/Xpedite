@@ -31,14 +31,13 @@ namespace xpedite { namespace framework {
     return callSites;
   }
 
-  void persistHeader(int fd_) {
-    static auto tscHz = util::estimateTscHz();
+  void persistHeader(int fd_, uint64_t tscHz_) {
+    timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
     auto callSites = buildCallSiteList();
-    timeval  time;
-    gettimeofday(&time, nullptr);
     auto capacity = FileHeader::capacity(callSites.size());
     std::unique_ptr<char []> buffer {new char[capacity]};
-    new (buffer.get()) FileHeader {callSites, time, tscHz, pmu::pmuCtl().pmcCount()};
+    new (buffer.get()) FileHeader {callSites, time, tscHz_, pmu::pmuCtl().pmcCount()};
     write(fd_, buffer.get(), capacity);
     XpediteLogInfo << "persisted file header with " << callSites.size() << " call sites  | capacity "
       << sizeof(FileHeader) << " + " << FileHeader::callSiteSize(callSites.size()) << " = "
@@ -50,12 +49,13 @@ namespace xpedite { namespace framework {
     if(!begin_ || begin_ == end_) {
       return;
     }
+
     uint64_t ccstart {RDTSC()};
-    timeval  time;
-    gettimeofday(&time, nullptr);
+    // Convert the first sample's Tsc to POSIX time and persist in the segment header for clock-synchronization in post-processing
+    auto firstSampleTimespec = util::posixNanosecondsToTimespec(util::TscConverter::instance().toPosixNanoseconds(begin_->tsc()));
     unsigned size = reinterpret_cast<const char*>(end_) - reinterpret_cast<const char*>(begin_);
 
-    SegmentHeader segmentHeader{time, size, ++batchCount}; 
+    SegmentHeader segmentHeader{firstSampleTimespec, size, ++batchCount};
     write(fd_, &segmentHeader, sizeof(segmentHeader));
     write(fd_, begin_, size);
     if(probes::config().verbose()) {

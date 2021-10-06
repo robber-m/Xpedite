@@ -50,10 +50,12 @@ typedef enum IterState {
 
 using ClockTicks = std::chrono::duration<double, std::ratio<1, 2494429297LL>>;
 
+// TODO: pull this from the default clock frequency instead
+#define CLOCK_TICKS_PER_SECOND 2494429297ULL
 struct xpedite_iter {
      IterState_t state;
      bt_packet *packet;
-     uint64_t packet_roll_timestamp;
+     uint64_t packet_roll_tsc;
      SamplesLoader::Iterator samples;
      struct {
           // holds both the tsc and posix nanosecond representation of the timestamp for TSC to posix conversions
@@ -61,11 +63,6 @@ struct xpedite_iter {
           std::chrono::nanoseconds ns;
      } reference_sample;
 };
-
-std::chrono::nanoseconds _clock_ticks_to_nanoseconds(struct xpedite_iter *iter, ClockTicks tsc) {
-     return iter->reference_sample.ns + std::chrono::duration_cast<std::chrono::nanoseconds>(tsc-iter->reference_sample.tsc);
-}
-
 
 // TODO: move to a plugin system where users can provide their own probe-data decoders
 #define POPULATE_PRODUCT_PROBE_SPECIFIC_FIELDS
@@ -145,6 +142,8 @@ void create_metadata_and_stream(bt_self_component *self_component,
     /* Create a default clock class (1 GHz frequency) */
     // TODO: set the clock frequency to the processor frequency?
     bt_clock_class *clock_class = bt_clock_class_create(self_component);
+    bt_clock_class_set_frequency(clock_class, xpedite_in->loader->tscHz());
+    // bt_clock_class_set_offset(clock_class, ); ORIGIN == 0 TODO: SECONDS_SINCE_START=((first_sample_tsc - ORIGIN)/tsc_frequency) START_TSC=(SECONDS_SINCE_START*tsc_frequency) TODO: how far do I have to offset TSC in cycles to align it to a second boundary, how far do I have to offset TSC in seconds to get back to 1/1/1970 @ 00:00:00.000000000
     // TODO: use the clock class to perform the cycles to nanoseconds since
     // epoch computations. It sounds like I need to set offset in seconds
     // since the epoch and the clock frequency: https://babeltrace.org/docs/v2.0/libbabeltrace2/group__api-tir-clock-cls.html#gac3a2f1bf8b2ad3b1e569d47fbb1fcf70
@@ -369,7 +368,7 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               if ( iter->state != ITER_STATE_BEGIN_STREAM ) {
                    if ( iter->packet ) {
                         // TODO: create packet end message and clear the packet pointer
-                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_timestamp);
+                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_tsc);
                         BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
                    } else {
                         messages[(*count)++] = bt_message_stream_end_create(self_message_iterator, xpedite_in->stream);
@@ -389,21 +388,20 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               } break;
               case ITER_STATE_APPEND_SAMPLES: {
                    // create an event
-                   uint64_t sample_timestamp = _clock_ticks_to_nanoseconds(iter, ClockTicks(sample.tsc())).count();
                    if ( !iter->packet ) {
                       iter->packet = bt_packet_create(xpedite_in->stream);
                       bt_field *context = bt_packet_borrow_context_field(iter->packet);
                       bt_field_integer_signed_set_value(bt_field_structure_borrow_member_field_by_name(context, "tid"), xpedite_in->tid);
-                      iter->packet_roll_timestamp = sample_timestamp + 1000000000ULL; // roll packets over every second
-                      messages[(*count)++] = bt_message_packet_beginning_create_with_default_clock_snapshot(self_message_iterator, iter->packet, sample_timestamp);
-                   } else if ( sample_timestamp > iter->packet_roll_timestamp ) {
-                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_timestamp);
+                      iter->packet_roll_tsc = sample.tsc() + CLOCK_TICKS_PER_SECOND; // roll packets over every second. TODO: consider a different heuristic for this
+                      messages[(*count)++] = bt_message_packet_beginning_create_with_default_clock_snapshot(self_message_iterator, iter->packet, sample.tsc());
+                   } else if ( sample.tsc() > iter->packet_roll_tsc ) {
+                        messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_tsc);
                         BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
                    } else {
                         uint64_t event_class_id = (uint64_t)sample.returnSite();
                         const struct bt_event_class *event_class = bt_stream_class_borrow_event_class_by_id_const(bt_stream_borrow_class(xpedite_in->stream), event_class_id);
 
-                        bt_message *message = bt_message_event_create_with_packet_and_default_clock_snapshot(self_message_iterator, event_class, iter->packet, sample_timestamp); // TODO: clock stuff
+                        bt_message *message = bt_message_event_create_with_packet_and_default_clock_snapshot(self_message_iterator, event_class, iter->packet, sample.tsc()); // TODO: clock stuff
                         #ifdef POPULATE_DEBUG_INFO
                         {
                              // set debug info associated with this event

@@ -19,13 +19,13 @@ namespace xpedite { namespace framework {
     static constexpr uint64_t XPEDITE_SEGMENT_HDR_SIG {0x5CA1AB1E887A57EFUL};
 
     uint64_t _signature;
-    timeval  _time;
+    timespec _time;
     uint32_t _size;
     uint32_t _seq;
 
     public:
 
-    SegmentHeader(timeval time_, unsigned size_, unsigned seq_)
+    SegmentHeader(timespec time_, unsigned size_, unsigned seq_)
       : _signature {XPEDITE_SEGMENT_HDR_SIG}, _time (time_), _size {size_}, _seq {seq_} {
     }
 
@@ -33,7 +33,7 @@ namespace xpedite { namespace framework {
       return std::make_tuple(reinterpret_cast<const probes::Sample*>(this + 1), static_cast<unsigned>(_size));
     }
 
-    timeval time()  const noexcept { return _time; }
+    timespec time() const noexcept { return _time; }
     uint32_t size() const noexcept { return _size; }
     uint32_t seq()  const noexcept { return _seq;  }
 
@@ -43,7 +43,7 @@ namespace xpedite { namespace framework {
   {
     uint64_t _signature;
     uint64_t _version;
-    timeval  _time;
+    timespec _time;
     uint64_t _tscHz;
     uint32_t _pmcCount;
     uint32_t _callSiteCount;
@@ -62,7 +62,7 @@ namespace xpedite { namespace framework {
       return sizeof(FileHeader) + callSiteSize(callSiteCount_);
     }
 
-    FileHeader(const std::vector<CallSiteInfo>& callSites_, timeval time_, uint64_t tscHz_, uint32_t pmcCount_)
+    FileHeader(const std::vector<CallSiteInfo>& callSites_, timespec time_, uint64_t tscHz_, uint32_t pmcCount_)
       : _signature {XPEDITE_FILE_HDR_SIG}, _version {XPEDITE_VERSION}, _time (time_),
         _tscHz {tscHz_}, _pmcCount {pmcCount_}, _callSiteCount {static_cast<uint32_t>(callSites_.size())} {
       memcpy(reinterpret_cast<char*>(_callSites), callSites_.data(), callSiteSize(callSites_.size()));
@@ -72,7 +72,7 @@ namespace xpedite { namespace framework {
       return _signature == XPEDITE_FILE_HDR_SIG && _version == XPEDITE_VERSION;
     }
 
-    timeval time()      const noexcept { return _time;     }
+    timespec time()     const noexcept { return _time;     }
     uint64_t tscHz()    const noexcept { return _tscHz;    }
     uint32_t pmcCount() const noexcept { return _pmcCount; }
 
@@ -85,7 +85,7 @@ namespace xpedite { namespace framework {
     }
   } __attribute__((packed));
 
-  void persistHeader(int fd_);
+  void persistHeader(int fd_, uint64_t tscHz_);
   void persistData(int fd_, const probes::Sample* begin_, const probes::Sample* end_);
 
 }}
