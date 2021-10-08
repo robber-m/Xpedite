@@ -12,6 +12,8 @@
 
 #pragma once
 #include <xpedite/platform/Builtins.H>
+
+#ifdef __cplusplus
 #include <xpedite/probes/CallSite.H>
 
 namespace xpedite { namespace probes {
@@ -35,6 +37,28 @@ extern "C" {
 extern xpedite::probes::Trampoline xpediteTrampolinePtr;
 extern xpedite::probes::Trampoline xpediteDataProbeTrampolinePtr;
 extern xpedite::probes::Trampoline xpediteIdentityTrampolinePtr;
+#else
+
+enum CallSiteAttr
+{
+ CALL_SITE_ATTR_IS_ACTIVE               = 1 << 0,
+ CALL_SITE_ATTR_CAN_BEGIN_TXN           = 1 << 1,
+ CALL_SITE_ATTR_CAN_SUSPEND_TXN         = 1 << 2,
+ CALL_SITE_ATTR_CAN_RESUME_TXN          = 1 << 3,
+ CALL_SITE_ATTR_CAN_END_TXN             = 1 << 4,
+ CALL_SITE_ATTR_CAN_STORE_DATA          = 1 << 5,
+ CALL_SITE_ATTR_IS_POSITION_INDEPENDENT = 1 << 6
+};
+
+struct Instructions;
+struct Probe;
+void XPEDITE_CALLBACK xpediteAddProbe(struct Probe* probe_, volatile struct Instructions* callSite_, volatile struct Instructions* returnSite_);
+void XPEDITE_CALLBACK xpediteRemoveProbe(struct Probe* probe_);
+
+extern void (*xpediteTrampolinePtr) (void);
+extern void (*xpediteDataProbeTrampolinePtr) (void);
+extern void (*xpediteIdentityTrampolinePtr) (void);
+#endif
 
 #define XPEDITE_ALIGN_STACK                                      \
     "   mov   %%rsp, %%rdi        \n"                            \
@@ -113,6 +137,7 @@ extern xpedite::probes::Trampoline xpediteIdentityTrampolinePtr;
 
 #define XPEDITE_FLAGGED_PROBE(NAME, ATTRIBUTES) XPEDITE_DEFINE_PROBE(#NAME, __FILE__, __LINE__, __PRETTY_FUNCTION__, ATTRIBUTES)
 
+#ifdef __cplusplus
 #define XPEDITE_DEFINE_DATA_PROBE(NAME, DATA, FILE, LINE, FUNC, ATTRIBUTES)                   \
   asm __volatile__ (                                                                          \
     XPEDITE_PROBE_ASM(xpediteDataProbeTrampolinePtr)                                          \
@@ -124,11 +149,24 @@ extern xpedite::probes::Trampoline xpediteIdentityTrampolinePtr;
      [Attributes] "i"(ATTRIBUTES | xpedite::probes::CallSiteAttr::CAN_STORE_DATA),            \
      "A"(DATA)                                                                                \
     : "flags")
+#else
+#define XPEDITE_DEFINE_DATA_PROBE(NAME, DATA, FILE, LINE, FUNC, ATTRIBUTES)                   \
+  asm __volatile__ (                                                                          \
+    XPEDITE_PROBE_ASM(xpediteDataProbeTrampolinePtr)                                          \
+    ::                                                                                        \
+     [Name] "i"(NAME),                                                                        \
+     [File] "i"(FILE),                                                                        \
+     [Func] "i"(FUNC),                                                                        \
+     [Line] "i"(LINE),                                                                        \
+     [Attributes] "i"(ATTRIBUTES | CALL_SITE_ATTR_CAN_STORE_DATA),                            \
+     "A"(DATA)                                                                                \
+    : "flags")
+#endif
 
 #define XPEDITE_FLAGGED_DATA_PROBE(NAME, DATA, ATTRIBUTES)   XPEDITE_DEFINE_DATA_PROBE(#NAME, DATA, __FILE__, __LINE__, __PRETTY_FUNCTION__, ATTRIBUTES)
 
 #define XPEDITE_DEFINE_IDENTITY_PROBE(NAME, FILE, LINE, FUNC, ATTRIBUTES) \
-  ({ __uint128_t id {};                                                   \
+  ({ __uint128_t id = {};                                                 \
     asm __volatile__ (                                                    \
       XPEDITE_PROBE_ASM(xpediteIdentityTrampolinePtr)                     \
       : "=A"(id):                                                         \

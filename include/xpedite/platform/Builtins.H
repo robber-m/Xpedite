@@ -32,6 +32,7 @@
 #define XPEDITE_CACHELINE_SIZE 64
 #endif
 
+#ifdef __cplusplus
 namespace xpedite { namespace common {
 
   inline __attribute__((always_inline)) void compilerBarrier() noexcept {
@@ -44,3 +45,4 @@ namespace xpedite { namespace common {
   }
 
 }}
+#endif

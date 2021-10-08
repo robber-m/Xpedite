@@ -48,20 +48,14 @@ typedef enum IterState {
      ITER_STATE_APPEND_SAMPLES,
 } IterState_t;
 
-using ClockTicks = std::chrono::duration<double, std::ratio<1, 2494429297LL>>;
-
 // TODO: pull this from the default clock frequency instead
-#define CLOCK_TICKS_PER_SECOND 2494429297ULL
 struct xpedite_iter {
+     bool initialized;
      IterState_t state;
      bt_packet *packet;
      uint64_t packet_roll_tsc;
      SamplesLoader::Iterator samples;
-     struct {
-          // holds both the tsc and posix nanosecond representation of the timestamp for TSC to posix conversions
-          ClockTicks tsc;
-          std::chrono::nanoseconds ns;
-     } reference_sample;
+     timespec segment_start_time;
 };
 
 // TODO: move to a plugin system where users can provide their own probe-data decoders
@@ -139,14 +133,14 @@ void create_metadata_and_stream(bt_self_component *self_component,
     /* Create a stream trace class within `trace_class` */
     bt_stream_class *stream_class = bt_stream_class_create(trace_class);
 
-    /* Create a default clock class (1 GHz frequency) */
-    // TODO: set the clock frequency to the processor frequency?
     bt_clock_class *clock_class = bt_clock_class_create(self_component);
+    /* Create a default clock class (processor frequency) */
     bt_clock_class_set_frequency(clock_class, xpedite_in->loader->tscHz());
-    // bt_clock_class_set_offset(clock_class, ); ORIGIN == 0 TODO: SECONDS_SINCE_START=((first_sample_tsc - ORIGIN)/tsc_frequency) START_TSC=(SECONDS_SINCE_START*tsc_frequency) TODO: how far do I have to offset TSC in cycles to align it to a second boundary, how far do I have to offset TSC in seconds to get back to 1/1/1970 @ 00:00:00.000000000
-    // TODO: use the clock class to perform the cycles to nanoseconds since
-    // epoch computations. It sounds like I need to set offset in seconds
-    // since the epoch and the clock frequency: https://babeltrace.org/docs/v2.0/libbabeltrace2/group__api-tir-clock-cls.html#gac3a2f1bf8b2ad3b1e569d47fbb1fcf70
+    bt_clock_class_set_origin_is_unix_epoch(clock_class, BT_TRUE); // we will use clock_class->offset to align origin to the UNIX epoch
+    // TODO: set the precision to one nanosecond worth of ticks or change the segment header tv_nsecs member to hold the second-offset in clock ticks rather than nanoseconds
+
+    // use the clock class to perform the cycles to nanoseconds since
+    // epoch computations
 
     /*
      * Set `clock_class` as the default clock class of `stream_class`.
@@ -253,10 +247,10 @@ bt_component_class_initialize_method_status xpedite_in_initialize(
     /* Create the source component's metadata and stream objects */
     create_metadata_and_stream(self_component, xpedite_in);
     const std::regex samples_file_path_regex(".*/xpedite-(.*)-([0-9]+)-([0-9]+)-[^-]+.data");
-    std::cout<< "trying to match regex for: "<< samples_file_path << std::endl;;
+    //std::cout<< "trying to match regex for: "<< samples_file_path << std::endl;;
     std::cmatch samples_file_info_match;
     if (std::regex_match(samples_file_path, samples_file_info_match, samples_file_path_regex)) {
-         std::cout<< "matched the regex!\n";
+         //std::cout<< "matched the regex!\n";
          // TODO: validate that the executable name matches the appinfo
          uint64_t trace_id = stoull(samples_file_info_match[2].str()); // TODO: use
          int32_t thread_id = stol(samples_file_info_match[3].str(), nullptr, 10);
@@ -297,6 +291,30 @@ void xpedite_in_finalize(bt_self_component_source *self_component_source)
 }
 
 /*
+ * Seeks to the beginning of the message stream for the associated iterator input source
+ */
+static bt_message_iterator_class_seek_beginning_method_status xpedite_in_message_iterator_seek_beginning(bt_self_message_iterator *self_message_iterator) {
+    /* Retrieve the component's private data from its user data */
+    struct xpedite_iter *iter = (struct xpedite_iter*)bt_self_message_iterator_get_data(self_message_iterator);
+    struct xpedite_in *xpedite_in = (struct xpedite_in*)bt_self_component_get_data(
+        bt_self_message_iterator_borrow_component(self_message_iterator));
+
+    iter->state = ITER_STATE_BEGIN_STREAM;
+    if ( iter->packet ) {
+        // discard existing packet if in the middle of creating one
+        BT_PACKET_PUT_REF_AND_RESET(iter->packet); // next time through we will create the stream end message
+    }
+
+    if ( iter->initialized ) {
+        iter->samples.~Iterator();
+    }
+
+    iter->samples = xpedite_in->loader->begin();
+    iter->initialized = true;
+    return BT_MESSAGE_ITERATOR_CLASS_SEEK_BEGINNING_METHOD_STATUS_OK;
+}
+
+/*
  * Initializes the message iterator.
  */
 static
@@ -310,13 +328,22 @@ xpedite_in_message_iterator_initialize(
     struct xpedite_in *xpedite_in = (struct xpedite_in*)bt_self_component_get_data(
         bt_self_message_iterator_borrow_component(self_message_iterator));
 
-    struct xpedite_iter *iter = (struct xpedite_iter*)calloc(1, sizeof(*iter));
-    iter->state = ITER_STATE_BEGIN_STREAM;
-    /* Allocate a private data structure */
-    iter->samples = xpedite_in->loader->begin();
+    bt_self_message_iterator_configuration_set_can_seek_forward(configuration, BT_TRUE);
 
+    /* Allocate a private data structure */
+    struct xpedite_iter *iter = (struct xpedite_iter*)calloc(1, sizeof(*iter));
+    iter->initialized = false;
     /* Set the message iterator's user data to our private data structure */
     bt_self_message_iterator_set_data(self_message_iterator, iter);
+
+    // TODO: set seek beginning and seek to ns from origin methods. also, consider the can_seek_forward method too!
+
+    // TODO: consider returning AGAIN, checking for intterupts and looping for big seeks?
+    // TODO: does my packet need to emit a timestamp that exactly matches the seek time??
+    if ( xpedite_in_message_iterator_seek_beginning(self_message_iterator) != BT_MESSAGE_ITERATOR_CLASS_SEEK_BEGINNING_METHOD_STATUS_OK ) {
+        free(iter);
+        return BT_MESSAGE_ITERATOR_CLASS_INITIALIZE_METHOD_STATUS_ERROR;
+    }
 
     return BT_MESSAGE_ITERATOR_CLASS_INITIALIZE_METHOD_STATUS_OK;
 }
@@ -358,9 +385,10 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
     struct xpedite_in *xpedite_in = (struct xpedite_in*)bt_self_component_get_data(
         bt_self_message_iterator_borrow_component(self_message_iterator));
 
+    auto clock_class = bt_stream_class_borrow_default_clock_class(bt_stream_borrow_class(xpedite_in->stream));
+
     auto end = xpedite_in->loader->end();
     while ( *count < capacity ) {
-         //std::cout<< "nmessages: " << std::dec << *count << " / " << capacity << std::endl;
          if ( iter->samples == end ) {
               // done collecting samples
               /* Message iterator is ended: return the corresponding status */
@@ -377,14 +405,36 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
               }
          } else {
               auto &sample = *(iter->samples);
+              {
+                   // re-align the clock to POSIX each time we process a new recorded segment
+                   auto new_segment_start_time = iter->samples.segmentStartTime();
+                   //std::cout << "Old (sec, nsec): (" << iter->segment_start_time.tv_sec << ", " << iter->segment_start_time.tv_nsec << "), New (sec, nsec): ("<< new_segment_start_time.tv_sec << ", " << new_segment_start_time.tv_nsec << ")\n";
+                   if ( (iter->segment_start_time.tv_nsec != new_segment_start_time.tv_nsec) ||
+                        (iter->segment_start_time.tv_sec != new_segment_start_time.tv_sec) ) {
+
+                        auto clock_frequency = bt_clock_class_get_frequency(clock_class);
+
+                        int64_t seconds_since_tsc_origin = sample.tsc() / clock_frequency;
+                        int64_t posix_seconds_offset = (int64_t)new_segment_start_time.tv_sec - seconds_since_tsc_origin;
+                        auto cycles_since_second = (uint64_t)new_segment_start_time.tv_nsec * clock_frequency / 1000000000ULL;
+                        while ( XPEDITE_UNLIKELY(cycles_since_second >= clock_frequency) ) {
+                             // TODO: decide on the best way to handle if our originally-estimated frequency drifts from the actual frequency
+                             cycles_since_second -= clock_frequency;
+                             posix_seconds_offset++;
+                        }
+                        bt_clock_class_set_offset(clock_class, posix_seconds_offset, cycles_since_second);
+
+                        // update cached value
+                        iter->segment_start_time.tv_nsec = new_segment_start_time.tv_nsec;
+                        iter->segment_start_time.tv_sec = new_segment_start_time.tv_sec;
+                   }
+              }
+
               switch( iter->state ) {
               case ITER_STATE_BEGIN_STREAM: {
                  messages[(*count)++] = bt_message_stream_beginning_create(self_message_iterator, xpedite_in->stream);
-                 iter->reference_sample.tsc = ClockTicks(sample.tsc());
-                 iter->reference_sample.ns = std::chrono::nanoseconds(1632755093515051228-100);// TODO: make this dynamic based on the parsed data and try to figure out how the clock stuff really works
                  //std::cout<< "beginning stream 0x" << std::hex << (uintptr_t)messages[*count - 1] << std::endl;
                  iter->state = ITER_STATE_APPEND_SAMPLES;
-                      // TODO: set the default clock's offset in seconds/figure out how to use the babeltrace clocks
               } break;
               case ITER_STATE_APPEND_SAMPLES: {
                    // create an event
@@ -392,7 +442,8 @@ bt_message_iterator_class_next_method_status xpedite_in_message_iterator_next(
                       iter->packet = bt_packet_create(xpedite_in->stream);
                       bt_field *context = bt_packet_borrow_context_field(iter->packet);
                       bt_field_integer_signed_set_value(bt_field_structure_borrow_member_field_by_name(context, "tid"), xpedite_in->tid);
-                      iter->packet_roll_tsc = sample.tsc() + CLOCK_TICKS_PER_SECOND; // roll packets over every second. TODO: consider a different heuristic for this
+                      // TODO: consider instead modeling Xpedite segments as packets?
+                      iter->packet_roll_tsc = sample.tsc() + bt_clock_class_get_frequency(clock_class); // roll packets over every second. TODO: consider a different heuristic for this. Maybe one "packet" per "segment"?
                       messages[(*count)++] = bt_message_packet_beginning_create_with_default_clock_snapshot(self_message_iterator, iter->packet, sample.tsc());
                    } else if ( sample.tsc() > iter->packet_roll_tsc ) {
                         messages[(*count)++] = bt_message_packet_end_create_with_default_clock_snapshot(self_message_iterator, iter->packet, iter->packet_roll_tsc);
@@ -465,4 +516,5 @@ BT_PLUGIN_SOURCE_COMPONENT_CLASS_MESSAGE_ITERATOR_CLASS_INITIALIZE_METHOD(input,
     xpedite_in_message_iterator_initialize);
 BT_PLUGIN_SOURCE_COMPONENT_CLASS_MESSAGE_ITERATOR_CLASS_FINALIZE_METHOD(input,
     xpedite_in_message_iterator_finalize);
-
+BT_PLUGIN_SOURCE_COMPONENT_CLASS_MESSAGE_ITERATOR_CLASS_SEEK_BEGINNING_METHODS(input,
+    xpedite_in_message_iterator_seek_beginning, NULL);

@@ -75,18 +75,20 @@ namespace xpedite { namespace framework {
       const probes::Sample* _samples;
       const void* _end;
       unsigned _size;
+      timespec _segmentStartTime;
 
       public:
 
       explicit Iterator(const SegmentHeader* samplesHeader_, const void* end_)
-        : _samples {reinterpret_cast<const probes::Sample*>(end_)}, _end {end_}, _size {} {
+        : _samples {reinterpret_cast<const probes::Sample*>(end_)}, _end {end_}, _size {}, _segmentStartTime {} {
         if(samplesHeader_ < _end) {
           std::tie(_samples, _size) = samplesHeader_->samples();
+          _segmentStartTime = samplesHeader_->time();
         }
       }
 
       explicit Iterator(const void* begin_, const void* end_)
-        : _samples {reinterpret_cast<const probes::Sample*>(begin_)}, _end {end_}, _size {} {
+        : _samples {reinterpret_cast<const probes::Sample*>(begin_)}, _end {end_}, _size {}, _segmentStartTime {} {
       }
 
       Iterator& operator++() {
@@ -95,6 +97,7 @@ namespace xpedite { namespace framework {
           _samples = _samples->next();
           if(!_size && _samples < _end) {
             auto samplesHeader = reinterpret_cast<const SegmentHeader*>(_samples);
+            _segmentStartTime = samplesHeader->time();
             std::tie(_samples, _size) = samplesHeader->samples();
           }
         }
@@ -117,6 +120,10 @@ namespace xpedite { namespace framework {
 
       reference operator*() const {
         return *_samples;
+      }
+
+      const timespec& segmentStartTime() const noexcept {
+        return _segmentStartTime;
       }
     };
 

@@ -60,14 +60,15 @@ namespace xpedite { namespace util {
 
   inline uint64_t timespecToPosixNanoseconds(timespec &ts)
   {
-     return ts.tv_sec * NANOS + ts.tv_nsec;
+     return (uint64_t)ts.tv_sec * NANOS + ts.tv_nsec;
   }
 
   inline timespec posixNanosecondsToTimespec(uint64_t posixNanoseconds)
   {
     timespec ts;
-    ts.tv_sec = posixNanoseconds / NANOS;
-    ts.tv_nsec = posixNanoseconds - (posixNanoseconds * NANOS);
+    uint64_t posixSeconds = posixNanoseconds / NANOS;
+    ts.tv_sec = posixSeconds;
+    ts.tv_nsec = posixNanoseconds - (posixSeconds * NANOS);
     return ts;
   }
 
@@ -98,8 +99,16 @@ namespace xpedite { namespace util {
         __m128 vec;
       };
 
+      static constexpr uint32_t SYNC_USECS {100000}; // 100 milliseconds
       TscConverter() {
+        _tscToPosixScaleFactor.ratio = 0;
+        _tscToPosixScaleFactor.offset = 0;
+
         _calibrationThread = std::thread(calibrate, &_tscToPosixScaleFactor);
+        // Block in the constructor until the calibration thread completes initialization
+        while (_tscToPosixScaleFactor.ratio == 0) {
+             usleep(SYNC_USECS);
+        }
       }
 
       // Delete copy/move so extra instances can't be created/moved.
@@ -111,7 +120,7 @@ namespace xpedite { namespace util {
       volatile TscScaleFactor _tscToPosixScaleFactor;
       std::thread _calibrationThread;
 
-      static std::tuple<uint64_t, uint64_t> getTscAndPosixNanoseconds() {
+      static std::tuple<uint64_t, int64_t> getTscAndPosixNanoseconds() {
         uint64_t tsc = 0;
         int64_t posix = 0;
 
@@ -138,7 +147,6 @@ namespace xpedite { namespace util {
       // calibrate the TSC to POSIX time scale factor
       static void calibrate(volatile TscScaleFactor *tscToPosixScaleFactor)
       {
-        constexpr uint32_t SYNC_USECS {100000}; // 100 milliseconds
         static uint64_t tscHz = estimateTscHz();
         const uint64_t minimumCalibrationTscInterval = SYNC_USECS * ((double)tscHz / 1000000) * 9 / 10; // TODO: how did Matt come up with this value?
 
