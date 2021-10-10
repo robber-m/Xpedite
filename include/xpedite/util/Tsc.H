@@ -58,12 +58,12 @@ namespace xpedite { namespace util {
     return elapsedTsc * NANOS / elapsedNsec;
   }
 
-  inline uint64_t timespecToPosixNanoseconds(timespec &ts)
+  inline uint64_t timespecToPosixNanoseconds(const timespec &ts)
   {
      return (uint64_t)ts.tv_sec * NANOS + ts.tv_nsec;
   }
 
-  inline timespec posixNanosecondsToTimespec(uint64_t posixNanoseconds)
+  inline timespec posixNanosecondsToTimespec(const uint64_t posixNanoseconds)
   {
     timespec ts;
     uint64_t posixSeconds = posixNanoseconds / NANOS;
@@ -72,7 +72,98 @@ namespace xpedite { namespace util {
     return ts;
   }
 
-  // convert tsc values to/from POSIX nanoseconds since the UNIX epoch
+  // NOTE: tsc and posixNanoseconds should both represent the same point in time
+  struct TscPosixPair {
+    uint64_t tsc;
+    int64_t posixNanoseconds;
+  };
+
+  // TODO: assert 16-byte alignment for atomicity
+  // Supports thread-safe calibration and scaling of Tsc values to Nanoseconds since the UNIX Epoch
+  union TscToPosixScaleFactor {
+    struct {
+      double  ratio;
+      int64_t offset;
+    };
+    __m128 vec;
+
+    TscToPosixScaleFactor() : ratio {0}, offset {0} {
+    }
+
+    inline __m128 load() { // TODO: private?
+      volatile TscToPosixScaleFactor *volatileThis = this;
+      // TODO: assert 16-byte alignment for atomicity
+      return volatileThis->vec;
+    }
+
+    inline void store( __m128 val_ ) { // TODO: private?
+      volatile TscToPosixScaleFactor *volatileThis = this;
+      // TODO: assert 16-byte alignment for atomicity
+      volatileThis->vec = val_;
+    }
+
+    // Once initialized, the scale factor will always remain initialized
+    bool isInitialized() {
+      volatile TscToPosixScaleFactor *volatileThis = this;
+      return volatileThis->ratio == 0;
+    }
+
+    // Single-writer, but multiple readers may simultaneously call apply()
+    // returns true on success
+    bool calibrate(uint32_t calibrationIntervalMicroseconds, uint64_t tscHz, const TscPosixPair &previous, const TscPosixPair &current) {
+      TscToPosixScaleFactor currentScaleFactor;
+      if ( XPEDITE_UNLIKELY(isInitialized() == false) ) {
+        // First time calculating scale, don't have to worry about old scaling coeffs
+        currentScaleFactor.ratio  = (double) (current.posixNanoseconds - previous.posixNanoseconds) / (current.tsc - previous.tsc);
+        currentScaleFactor.offset = current.posixNanoseconds - (int64_t)(current.tsc * currentScaleFactor.ratio);
+      } else {
+        const uint64_t minimumCalibrationTscInterval = calibrationIntervalMicroseconds * ((double)tscHz / 1000000) * 9 / 10; // TODO: how did Matt come up with this value? Starting to understand.. limit == .10 meaning the ratio is only allowed to change 10% per interval. There should be 10 TSC intervals in a calibration interval... or maybe it means, if the new ratio is more than 10% larger or smaller than the old, change the offset and use the old ratio. Otherwise, adjust both the ratio and offset.
+
+
+        /* System clock can be adjusted by ntpd. To avoid seeing large system clock change over a very small
+           number of TSC ticks, which leads to too-large slope in linear transfer function, make sure enough
+           TSC ticks have elapsed since last sample */
+        if ((current.tsc - previous.tsc) < minimumCalibrationTscInterval) return false;
+
+        TscToPosixScaleFactor previousScaleFactor;
+        previousScaleFactor.vec = load();
+
+        // Calculate posix time from the new timestamp using the old scaling coefficients
+        uint64_t currentTscConvertedPosixNanoseconds = apply(current.tsc);
+
+        // Correct the conversion curve in a continous fashion (no discontinuous jumps forward or backward in posix time).
+        // Calculate new coefficients so error is estimated to taper to zero by the next calibration time.
+        // The graph of new conversions is the line from point (cur_tsc, cur_posix + err_posix) through point
+        // (2 * cur_tsc - prev_tsc, 2 * cur_posix - prev_posix)
+        currentScaleFactor.ratio  = (double) ((int64_t)2 * (int64_t)current.posixNanoseconds - (int64_t)previous.posixNanoseconds - (int64_t)currentTscConvertedPosixNanoseconds) / (current.tsc - previous.tsc);
+        double percentChange = (currentScaleFactor.ratio - previousScaleFactor.ratio) / previousScaleFactor.ratio;
+        constexpr double limit {0.10};
+
+        if (fabs(percentChange) > limit) {
+          currentScaleFactor.ratio = previousScaleFactor.ratio; // Use the old ratio if the new one changed too dramatically
+          currentScaleFactor.offset = current.posixNanoseconds - (int64_t)(current.tsc * currentScaleFactor.ratio);
+        } else {
+          currentScaleFactor.offset = currentTscConvertedPosixNanoseconds - (int64_t)(current.tsc * currentScaleFactor.ratio);
+        }
+      }
+
+      // Publish the new factor atomically
+      store( currentScaleFactor.vec );
+      return true;
+    }
+
+
+    // Multi-reader, scale tsc values to nanoseconds since the UNIX epoch
+    inline uint64_t apply(uint64_t tsc) {
+      //assert( isInitialized() == true ); // Calibrate must have been called once before calling apply()
+      TscToPosixScaleFactor coherentScaleFactor;
+      // read atomically to allow for thread-safe calibration
+      coherentScaleFactor.vec = load();
+      return (uint64_t) ((int64_t) (tsc * coherentScaleFactor.ratio) + coherentScaleFactor.offset);
+    }
+  };
+
+  // Convert tsc values to/from POSIX nanoseconds since the UNIX epoch
   class TscConverter
   {
     public:
@@ -82,28 +173,13 @@ namespace xpedite { namespace util {
       }
 
       // thread-safe w/r/t the calibration thread
-      uint64_t toPosixNanoseconds(uint64_t tsc) {
-           TscScaleFactor scaleFactor;
-           scaleFactor.vec = _tscToPosixScaleFactor.vec;
-
-           return (uint64_t) ((int64_t) (tsc * scaleFactor.ratio) + scaleFactor.offset);
+      inline uint64_t toPosixNanoseconds(uint64_t tsc) {
+        return _tscToPosixScaleFactor.apply(tsc);
       }
 
     private:
-
-      union TscScaleFactor {
-        struct {
-          double  ratio;
-          int64_t offset;
-        };
-        __m128 vec;
-      };
-
       static constexpr uint32_t SYNC_USECS {100000}; // 100 milliseconds
       TscConverter() {
-        _tscToPosixScaleFactor.ratio = 0;
-        _tscToPosixScaleFactor.offset = 0;
-
         _calibrationThread = std::thread(calibrate, &_tscToPosixScaleFactor);
         // Block in the constructor until the calibration thread completes initialization
         while (_tscToPosixScaleFactor.ratio == 0) {
@@ -117,10 +193,10 @@ namespace xpedite { namespace util {
       TscConverter(TscConverter&&) = delete;
       TscConverter& operator=(TscConverter&&) = delete;
 
-      volatile TscScaleFactor _tscToPosixScaleFactor;
+      TscToPosixScaleFactor _tscToPosixScaleFactor;
       std::thread _calibrationThread;
 
-      static std::tuple<uint64_t, int64_t> getTscAndPosixNanoseconds() {
+      static TscPosixPair getTscAndPosixNanoseconds() {
         uint64_t tsc = 0;
         int64_t posix = 0;
 
@@ -141,66 +217,23 @@ namespace xpedite { namespace util {
             posix = timespecToPosixNanoseconds(ts);
           }
         }
-        return std::make_tuple(tsc, posix);
+        return TscPosixPair{tsc, posix};
       }
 
       // calibrate the TSC to POSIX time scale factor
-      static void calibrate(volatile TscScaleFactor *tscToPosixScaleFactor)
+      static void calibrate(TscToPosixScaleFactor *tscToPosixScaleFactor)
       {
         static uint64_t tscHz = estimateTscHz();
-        const uint64_t minimumCalibrationTscInterval = SYNC_USECS * ((double)tscHz / 1000000) * 9 / 10; // TODO: how did Matt come up with this value?
-
-        int64_t previousPosixNanoseconds, currentPosixNanoseconds = 0;
-        uint64_t previousTsc, currentTsc = 0;
-
-        std::tie(previousTsc, previousPosixNanoseconds) = getTscAndPosixNanoseconds();
-
-        bool initialized = false;
+        auto previous = getTscAndPosixNanoseconds();
 
         while (true) {
           usleep(SYNC_USECS);
 
-          std::tie(currentTsc, currentPosixNanoseconds) = getTscAndPosixNanoseconds();
+          auto current = getTscAndPosixNanoseconds();
 
-          /* System clock can be adjusted by ntpd. To avoid seeing large system clock change over a very small
-             number of TSC ticks, which leads to too-large slope in linear transfer function, make sure enough
-             TSC ticks have elapsed since last sample */
-          if ((currentTsc - previousTsc) < minimumCalibrationTscInterval) continue;
-
-          TscScaleFactor scaleFactor;
-          if (!initialized) {
-            /// First time calculating scale, don't have to worry about old scaling coeffs
-            scaleFactor.ratio  = (double) (currentPosixNanoseconds - previousPosixNanoseconds) / (currentTsc - previousTsc);
-            scaleFactor.offset = currentPosixNanoseconds - (int64_t)(currentTsc * scaleFactor.ratio);
-          } else {
-            TscScaleFactor previousScaleFactor;
-            previousScaleFactor.vec = tscToPosixScaleFactor->vec;
-            /// Calc posix time from current timestamp using old scaling coeffs
-            uint64_t currentTscConvertedPosixNanoseconds = instance().toPosixNanoseconds(currentTsc);
-
-            // Correct the conversion curve in a continous fashion (no discontinuous jumps forward or backward in posix time).
-            // Calc new coeffs so error is estimated to taper to zero by the next calibration time.
-            // The graph of new conversion is line from point (cur_t, cur_p+err_p) thru point (2*cur_t-last_t, 2*cur_p-last_p).
-            // Where *_t is timestamp_time and *_p is posix_time.
-            scaleFactor.ratio  = (double) ((int64_t)2 * (int64_t)currentPosixNanoseconds - (int64_t)previousPosixNanoseconds - (int64_t)currentTscConvertedPosixNanoseconds) / (currentTsc - previousTsc);
-            double percentage = (scaleFactor.ratio - previousScaleFactor.ratio) / previousScaleFactor.ratio;
-            constexpr double limit {0.10};
-
-            if (fabs(percentage) > limit) {
-              scaleFactor.ratio = previousScaleFactor.ratio;
-              scaleFactor.offset = currentPosixNanoseconds - (int64_t)(currentTsc * scaleFactor.ratio);
-            } else {
-              scaleFactor.offset = currentTscConvertedPosixNanoseconds - (int64_t)(currentTsc * scaleFactor.ratio);
-            }
+          if ( tscToPosixScaleFactor->calibrate(SYNC_USECS, tscHz, previous, current) ) {
+            previous = current;
           }
-
-          // Publish the two factors atomically
-          // assert(IS_ALIGNED16(tscToPosixScaleFactor));
-          tscToPosixScaleFactor->vec = scaleFactor.vec;
-
-          initialized = true;
-          previousTsc = currentTsc;
-          previousPosixNanoseconds = currentPosixNanoseconds;
         }
       }
   };

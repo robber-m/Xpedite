@@ -26,7 +26,7 @@ namespace xpedite { namespace framework {
     public:
 
     SegmentHeader(timespec time_, unsigned size_, unsigned seq_)
-      : _signature {XPEDITE_SEGMENT_HDR_SIG}, _time (time_), _size {size_}, _seq {seq_} {
+      : _signature {XPEDITE_SEGMENT_HDR_SIG}, _time {time_}, _size {size_}, _seq {seq_} {
     }
 
     std::tuple<const probes::Sample*, unsigned> samples() const noexcept {
